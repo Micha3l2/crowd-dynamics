@@ -1,0 +1,134 @@
+import hoomd
+import gsd.hoomd
+import numpy as np
+import datetime, time
+import matplotlib as plt
+import math
+
+
+
+
+#helper functions to display simulation status
+class printStatus(hoomd.custom.Action):
+    def act(self, timestep):
+        global init_time, last_output
+        try:
+            sec_remaining = int((self._state._simulation.final_timestep - timestep) / self._state._simulation.tps)
+        except ZeroDivisionError:
+            sec_remaining = 0
+        print(
+            "Time", str(datetime.timedelta(seconds=int(time.time() - init_time))),
+            "| Step:", timestep,
+            "| TPS:", str(round(float(self._state._simulation.tps),3)),
+            "| ETR:", str(datetime.timedelta(seconds=sec_remaining))
+        )
+        last_output = time.time()
+
+class trigger_every_n_sec(hoomd.trigger.Trigger):
+    def __init__(self):
+        hoomd.trigger.Trigger.__init__(self)
+
+    def compute(self, timestep):
+        global last_output, update_every_n
+        return ((time.time() - last_output) >=update_every_n)
+
+class randomOrientation(hoomd.custom.Action):
+     def __init__(self, numParticles, probability, weightedRandoms):
+        self.numParticles = numParticles
+        self.probability = probability
+        self.weightedRandoms = weightedRandoms
+
+     def act(self, timestep):
+        snapshot = self._state.get_snapshot()
+        
+        for particle in range(self.numParticles):
+            if(weightedRandoms == True):
+                randomVar = np.random.random()
+            else:
+                randomVar = 0
+            
+            if(randomVar < probability):
+                newRandomAngle = 2 * np.pi * np.random.random()
+                snapshot.particles.orientation[particle] = [np.cos(newRandomAngle/2), 0, 0, np.sin(newRandomAngle/2)]
+
+        self._state.set_snapshot(snapshot)
+
+
+
+
+#system variable definitions
+diameter = 1 #diameter of particles
+dt = 1e-6 #time step size
+d_x = 15 #how many particles per row
+d_y = 15 #how many rows there are
+N = d_x * d_y #number of particles
+randomPeriod = 50000 #sets the amount of timesteps between re-randomizing orientations
+
+#variation within random orientation assignments by timestep
+weightedRandoms = False #chance that some particles will randomly not change orientations every timestep
+probability = 0.8      # number * 100 percent chance that a particle will change orientations at any 50000 timesteps
+
+#molecular definitions (come back to this later if needed)
+eps = 1 # epsilon is a constant affecting Lennard Jones function steepness/energy
+kT = 1 #system thermal energy
+
+particlePositions = [] #coordinates for each particle
+doorPosition = (0, 0, 0) #coordinates for door
+
+
+#set up p particles 
+for i in range(d_x):        
+  for j in range(d_y):
+    particlePositions.append([i, j, 0])
+
+
+
+start = gsd.hoomd.Frame() #initial frame
+start.particles.position = list(particlePositions) 
+start.particles.N = N
+start.particles.typeid = ([0] * N) #particles types (related to above indices)
+start.particles.types = ["A"] #A is particle and W is wall and B is barrier
+start.configuration.box = [30,30,0,0,0,0]
+with gsd.hoomd.open(name='randomNoBarriersIC.gsd', mode='w') as f:
+    f.append(start)
+
+#Setting up HOOMD simulation object
+simulation = hoomd.Simulation(device=hoomd.device.auto_select(), seed=1) #create simulation object
+simulation.create_state_from_gsd(filename='randomNoBarriersIC.gsd') # load initial state
+
+#Custom movement
+fire = hoomd.md.force.Active(filter = hoomd.filter.All())
+fire.active_force['A'] = (60, 0, 0) #accerlates back to this maximum (after collision)
+
+#Setting up particle interactions
+collision = hoomd.md.pair.LJ(
+    nlist=hoomd.md.nlist.Cell(buffer=0.5),
+    default_r_cut=0.75 #stop applying force at 0.75
+)
+collision.params[('A', 'A')] = dict(epsilon=eps, sigma=diameter) #collision between particles [A,A]
+
+randomness = hoomd.md.methods.Brownian(filter=hoomd.filter.Type(['A']), kT = 1*kT)
+
+integrator = hoomd.md.Integrator(dt = dt) #define an integrator
+integrator.methods = [randomness] #add random Brownian motion to particle movements
+integrator.forces = [fire,collision] #add forces to integrator
+simulation.operations.integrator = integrator  #put integrator in sim object
+
+update_every_n = 5
+simulation.operations.writers.append(hoomd.write.CustomWriter(action = printStatus(),trigger = trigger_every_n_sec()))
+
+gsd_writer = hoomd.write.GSD(trigger = hoomd.trigger.Periodic(int(1e4)), filename = "random_orientation_no_barriers.gsd", mode = 'wb', filter = hoomd.filter.All(), dynamic=['property', 'momentum', 'attribute'])
+simulation.operations.writers.append(gsd_writer)
+
+orientationRandomizer = hoomd.update.CustomUpdater(action = randomOrientation(numParticles=N,probability=probability,weightedRandoms=weightedRandoms),trigger=hoomd.trigger.Periodic(randomPeriod)) #randomizes particles
+simulation.operations.updaters.append(orientationRandomizer)
+
+# alignmentUpdate = hoomd.update.CustomUpdater(action=align(numParticles=N, doorX=doorPosition[0], doorY=doorPosition[1]),trigger=hoomd.trigger.Periodic(1000)) #trigger alignment every n timesteps
+# simulation.operations.updaters.append(alignmentUpdate)
+
+#Run simulation
+init_time = time.time()                              
+last_output = init_time                            
+simulation.run(2_000_000) #simulation length
+gsd_writer.flush()
+
